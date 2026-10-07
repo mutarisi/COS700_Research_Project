@@ -1,0 +1,185 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Demo Bank - sign in</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Demo Bank</h1>
+  <span class="sub">Prototype login page - not a real bank, do not enter real credentials</span>
+  <span class="status" id="status">connecting...</span>
+</header>
+
+<div class="login-wrap">
+  <div class="panel">
+    <div class="tabs">
+      <button id="tab-login">Sign in</button>
+      <button id="tab-enrol" class="secondary">Enrol a new account</button>
+    </div>
+
+    <div id="login-fields">
+      <label>Account
+        <select id="account"></select>
+      </label>
+      <label>Client polling interval
+        <select id="poll">
+          <option value="1">1 ms (as fine as the browser reports)</option>
+          <option value="20">20 ms</option>
+          <option value="30">30 ms</option>
+          <option value="60">60 ms</option>
+          <option value="100">100 ms</option>
+        </select>
+      </label>
+    </div>
+
+    <div id="enrol-fields" style="display: none">
+      <label>New account name
+        <input type="text" id="enrol-name" maxlength="20" placeholder="e.g. alice" autocomplete="off">
+      </label>
+      <p class="hint" id="enrol-progress">Type the password below and press Enter, repeatedly, until the account is ready.</p>
+    </div>
+
+    <label>Password
+      <input type="password" id="password" autocomplete="off" spellcheck="false">
+    </label>
+    <p class="hint">Demo password for every account: <code>.tie5Roanl</code> then Enter.
+      Type it in one go, without Backspace.</p>
+    <div class="controls">
+      <button id="clear" class="secondary">Clear and retype</button>
+      <button id="reset" class="secondary" style="display: none">Start enrolment over</button>
+    </div>
+
+    <div class="result" id="result"><div class="head"></div><div class="detail"></div></div>
+  </div>
+</div>
+
+<script>
+const $ = id => document.getElementById(id);
+const IGNORED = ["Shift", "CapsLock", "Tab"];
+let ws;
+let mode = "login";
+let attempt = null;       // {poll, phase, held: code -> key name, enterUp}
+let enrolStarted = false;
+
+function send(message) { ws.send(JSON.stringify(message)); }
+
+function show(kind, head, detail) {
+  const result = $("result");
+  result.className = "result show " + kind;
+  result.querySelector(".head").textContent = head;
+  result.querySelector(".detail").textContent = detail || "";
+}
+
+function setMode(next) {
+  mode = next;
+  $("tab-login").className = mode === "login" ? "" : "secondary";
+  $("tab-enrol").className = mode === "enrol" ? "" : "secondary";
+  $("login-fields").style.display = mode === "login" ? "" : "none";
+  $("enrol-fields").style.display = mode === "enrol" ? "" : "none";
+  $("reset").style.display = mode === "enrol" ? "" : "none";
+  $("result").className = "result";
+  clearAttempt();
+}
+
+function clearAttempt() {
+  attempt = null;
+  $("password").value = "";
+  $("password").focus();
+}
+
+// The client is the poller: above 1 ms it reports each key event at the
+// nearest tick of its own poll clock (random phase per attempt), as in the study.
+function stamp(t) {
+  if (attempt.poll <= 1) return t;
+  return Math.round((t + attempt.phase) / attempt.poll) * attempt.poll;
+}
+
+$("password").addEventListener("keydown", e => {
+  if (e.key === "Enter") e.preventDefault();
+  if (e.repeat || IGNORED.includes(e.key)) return;
+  if (!attempt) {
+    const account = mode === "enrol" ? $("enrol-name").value.trim() : $("account").value;
+    if (!account) { e.preventDefault(); show("wrong", "Enter an account name first."); return; }
+    const poll = mode === "enrol" ? 1 : Number($("poll").value);   // enrolment is always full resolution
+    attempt = {poll, phase: Math.random() * poll, held: {}, enterUp: false};
+    send({type: "start", account, poll_ms: poll, purpose: mode, source: "live"});
+  }
+  attempt.held[e.code] = e.key;
+  send({type: "key", k: e.key, e: "down", t: stamp(e.timeStamp)});
+});
+
+$("password").addEventListener("keyup", e => {
+  if (!attempt || !(e.code in attempt.held)) return;
+  const key = attempt.held[e.code];      // the name it went down with (Shift may be up by now)
+  delete attempt.held[e.code];
+  send({type: "key", k: key, e: "up", t: stamp(e.timeStamp)});
+  if (key === "Enter") attempt.enterUp = true;
+  if (attempt.enterUp && Object.keys(attempt.held).length === 0) {
+    send({type: "submit"});
+    attempt = null;
+    $("password").value = "";
+  }
+});
+
+function connect() {
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/client`);
+  ws.onopen = () => {
+    $("status").textContent = "connected"; $("status").className = "status live";
+    send({type: "accounts"});
+  };
+  ws.onclose = () => {
+    $("status").textContent = "disconnected - retrying"; $("status").className = "status";
+    setTimeout(connect, 1500);
+  };
+  ws.onmessage = message => {
+    const data = JSON.parse(message.data);
+    if (data.type === "accounts") {
+      const select = $("account");
+      const chosen = select.value;
+      select.innerHTML = "";
+      for (const account of data.accounts) select.add(new Option(account, account));
+      if (chosen) select.value = chosen;
+      if (!enrolStarted) $("enrol-progress").textContent =
+        `Type the password below and press Enter, ${data.enrol_target} times.`;
+    } else if (data.type === "decision") {
+      if (data.outcome === "accepted") {
+        show("ok", "Signed in.", `Typing rhythm matches the account holder (score ${data.score.toFixed(3)}, alert threshold ${data.threshold.toFixed(3)}).`);
+      } else if (data.outcome === "step_up") {
+        show("alert", "We need to confirm it's you.",
+             `Your password was correct, but the way it was typed does not match this account ` +
+             `(score ${data.score.toFixed(3)}, alert threshold ${data.threshold.toFixed(3)}). ` +
+             `An alert has been raised and a one-time code would be sent to the account holder.`);
+      } else if (data.outcome === "wrong_password") {
+        show("wrong", "Wrong password.", "Type .tie5Roanl in one go (no Backspace), then Enter.");
+      } else {
+        show("wrong", "Unknown account.", "Pick an account from the list, or enrol a new one.");
+      }
+    } else if (data.type === "enrol") {
+      enrolStarted = data.count > 0;
+      $("enrol-progress").textContent = data.count >= data.target
+        ? `${data.count} attempts recorded. The account is ready: switch to Sign in. More attempts make the profile steadier.`
+        : `${data.count} of ${data.target} attempts recorded.`;
+      $("result").className = "result";
+      if (data.ready) send({type: "accounts"});
+    } else if (data.type === "error") {
+      show("wrong", "Not accepted.", data.message);
+    }
+  };
+}
+
+$("tab-login").onclick = () => setMode("login");
+$("tab-enrol").onclick = () => setMode("enrol");
+$("clear").onclick = clearAttempt;
+$("reset").onclick = () => {
+  const account = $("enrol-name").value.trim();
+  if (account) send({type: "enrol_reset", account});
+  clearAttempt();
+};
+
+connect();
+</script>
+</body>
+</html>

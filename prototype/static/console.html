@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Fraud monitoring console</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>Fraud monitoring console</h1>
+  <span class="sub">Real-time account compromise alerts from keystroke rhythm at login</span>
+  <span class="status" id="status">connecting...</span>
+</header>
+
+<main>
+  <div class="panel">
+    <h2>Simulated login traffic (replay of held-out CMU attempts)</h2>
+    <div class="controls">
+      <label>Account
+        <select id="account"></select>
+      </label>
+      <label>Client polling interval
+        <select id="poll">
+          <option value="1">1 ms (full resolution)</option>
+          <option value="20">20 ms</option>
+          <option value="30">30 ms</option>
+          <option value="60">60 ms</option>
+          <option value="100">100 ms</option>
+        </select>
+      </label>
+      <label>Logins
+        <input type="number" id="n" value="30" min="1" max="500" style="width: 90px">
+      </label>
+      <label>Impostor share
+        <select id="share">
+          <option value="0.1">10%</option>
+          <option value="0.3" selected>30%</option>
+          <option value="0.5">50%</option>
+        </select>
+      </label>
+      <button id="start">Start replay</button>
+      <button id="stop" class="secondary" disabled>Stop</button>
+      <button id="clear" class="secondary">Clear</button>
+    </div>
+  </div>
+
+  <div class="tiles">
+    <div class="tile"><div class="value" id="t-logins">0</div><div class="name">Logins checked</div></div>
+    <div class="tile"><div class="value" id="t-alerts">0</div><div class="name">Alerts raised</div></div>
+    <div class="tile"><div class="value" id="t-caught">-</div><div class="name">Impostors caught</div></div>
+    <div class="tile"><div class="value" id="t-false">-</div><div class="name">Genuine logins flagged</div></div>
+    <div class="tile"><div class="value" id="t-msgs">-</div><div class="name">Key messages per login</div></div>
+    <div class="tile"><div class="value" id="t-latency">-</div><div class="name">Mean detection time</div></div>
+  </div>
+
+  <div class="banner" id="banner">No alerts yet.</div>
+
+  <div class="panel">
+    <h2>Login feed</h2>
+    <div class="feed">
+      <table>
+        <thead>
+          <tr><th>Time</th><th>Account</th><th>Source</th><th>Polling</th>
+              <th>Rhythm score vs alert threshold</th><th>Decision</th><th>Actually</th></tr>
+        </thead>
+        <tbody id="feed"></tbody>
+      </table>
+    </div>
+    <p class="note">The bar is the anomaly score of the typing rhythm; the tick is this account's alert
+      threshold at the client's polling interval. "Actually" is known only for replayed logins and is
+      never used for the decision.</p>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let tally;
+let ws;
+
+function resetTally() {
+  tally = {logins: 0, alerts: 0, impostors: 0, caught: 0, genuine: 0, flagged: 0,
+           messages: 0, latency: 0, scored: 0};
+}
+
+function renderTally() {
+  $("t-logins").textContent = tally.logins;
+  $("t-alerts").textContent = tally.alerts;
+  $("t-caught").textContent = tally.impostors ? `${tally.caught} / ${tally.impostors}` : "-";
+  $("t-false").textContent = tally.genuine ? `${tally.flagged} / ${tally.genuine}` : "-";
+  $("t-msgs").textContent = tally.scored ? Math.round(tally.messages / tally.scored) : "-";
+  $("t-latency").textContent = tally.scored ? (tally.latency / tally.scored).toFixed(1) + " ms" : "-";
+}
+
+function cell(row, text, className) {
+  const td = row.insertCell();
+  if (text !== undefined) td.textContent = text;
+  if (className) td.className = className;
+  return td;
+}
+
+function addEvent(event, live) {
+  const row = document.createElement("tr");
+  cell(row, event.time);
+  cell(row, event.account);
+  cell(row, event.source);
+  cell(row, event.poll_ms + " ms");
+
+  if (event.outcome === "wrong_password") {
+    cell(row, "not scored (password wrong)");
+    cell(row).innerHTML = '<span class="pill wrong">WRONG PASSWORD</span>';
+    cell(row, event.truth || "");
+    $("feed").prepend(row);
+    return;
+  }
+
+  // score bar scaled so the threshold tick sits at 60% of the bar
+  const scale = v => Math.max(0, Math.min(100, 60 * v / event.threshold));
+  const score = cell(row);
+  score.innerHTML = `<div class="score"><div class="bar"><div class="fill"></div><div class="tick"></div></div><span></span></div>`;
+  score.querySelector(".fill").style.width = scale(event.score) + "%";
+  score.querySelector(".fill").classList.toggle("over", event.alert);
+  score.querySelector(".tick").style.left = "60%";
+  score.querySelector("span").textContent = `${event.score.toFixed(3)} vs ${event.threshold.toFixed(3)}`;
+
+  cell(row).innerHTML = event.alert ? '<span class="pill alert">ALERT</span>' : '<span class="pill ok">OK</span>';
+  if (event.alert) row.className = "alert";
+
+  tally.logins++; tally.scored++;
+  tally.messages += event.key_messages;
+  tally.latency += event.detection_ms;
+  if (event.alert) tally.alerts++;
+
+  let actually = event.truth || "";
+  let actuallyClass = "";
+  if (event.truth) {
+    const impostor = event.truth.startsWith("impostor");
+    if (impostor) { tally.impostors++; if (event.alert) tally.caught++; }
+    else { tally.genuine++; if (event.alert) tally.flagged++; }
+    const verdict = impostor ? (event.alert ? "caught" : "MISSED") : (event.alert ? "FALSE ALARM" : "correct");
+    actually = `${event.truth}: ${verdict}`;
+    actuallyClass = "outcome " + (verdict === "caught" || verdict === "correct" ? "good" : "bad");
+  }
+  cell(row, actually, actuallyClass);
+  $("feed").prepend(row);
+
+  if (event.alert) showAlert(event, live);
+}
+
+function showAlert(event, live) {
+  const banner = $("banner");
+  banner.className = "banner alert";
+  banner.innerHTML = '<span class="title"></span><div class="body"></div>';
+  banner.querySelector(".title").textContent = `ALERT ${event.time}: possible account compromise on ${event.account}`;
+  banner.querySelector(".body").textContent =
+    `Password was correct, but the typing rhythm does not match the account holder ` +
+    `(score ${event.score.toFixed(3)}, threshold ${event.threshold.toFixed(3)}, ` +
+    `raised ${event.detection_ms.toFixed(1)} ms after the login was submitted). ` +
+    `Action taken: step-up verification requested.`;
+  if (live) {
+    banner.classList.remove("flash");
+    void banner.offsetWidth;      // restart the animation
+    banner.classList.add("flash");
+  }
+}
+
+function clearAll() {
+  resetTally();
+  renderTally();
+  $("feed").innerHTML = "";
+  $("banner").className = "banner";
+  $("banner").textContent = "No alerts yet.";
+}
+
+function setRunning(running) {
+  $("start").disabled = running;
+  $("stop").disabled = !running;
+}
+
+function connect() {
+  ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/ws/console`);
+  ws.onopen = () => { $("status").textContent = "connected"; $("status").className = "status live"; };
+  ws.onclose = () => {
+    $("status").textContent = "disconnected - retrying";
+    $("status").className = "status";
+    setTimeout(connect, 1500);
+  };
+  ws.onmessage = message => {
+    const data = JSON.parse(message.data);
+    if (data.type === "hello") {
+      const select = $("account");
+      const chosen = select.value;
+      select.innerHTML = "";
+      for (const account of data.accounts) select.add(new Option(account, account));
+      select.value = chosen || data.default_account;
+      clearAll();
+      for (const event of data.history) addEvent(event, false);
+      renderTally();
+      setRunning(data.replay_running);
+    } else if (data.type === "event") {
+      addEvent(data.event, true);
+      renderTally();
+    } else if (data.type === "replay") {
+      setRunning(data.running);
+    } else if (data.type === "clear") {
+      clearAll();
+    }
+  };
+}
+
+$("start").onclick = () => ws.send(JSON.stringify({
+  type: "replay_start", account: $("account").value, poll_ms: Number($("poll").value),
+  n: Number($("n").value), impostor_share: Number($("share").value)}));
+$("stop").onclick = () => ws.send(JSON.stringify({type: "replay_stop"}));
+$("clear").onclick = () => ws.send(JSON.stringify({type: "clear"}));
+
+resetTally();
+connect();
+</script>
+</body>
+</html>
