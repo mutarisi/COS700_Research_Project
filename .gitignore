@@ -1,0 +1,27 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# Regenerable: rebuilt from data/raw by `python src/downsample.py`
+data/processed/
+
+# Editor / OS
+.vscode/
+.idea/
+Thumbs.db
+~$*.docx
+
+# Third-party papers (copyrighted PDFs; kept locally, not versioned)
+papers/
+
+# Copy of data/raw for uploading to Kaggle
+kaggle/DSL-StrongPasswordData.csv
+
+# Per-seed checkpoints of run_training_seeds.py
+results/training_seeds/
+kaggle/*.zip
+
+# Report and proposal: kept locally (and on the local-with-docs branch), not published
+docs/
